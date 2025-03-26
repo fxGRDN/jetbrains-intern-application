@@ -1,0 +1,13 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+chunking-evaluation = {git = "https://github.com/brandonstarxel/chunking_evaluation.git"}
+
+[dev-packages]
+ipykernel = "*"
+
+[requires]
+python_version = "3.10"
