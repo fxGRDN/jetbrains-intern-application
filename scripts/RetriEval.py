@@ -6,6 +6,9 @@ from typing import Callable
 import torch
 import json
 from operator import itemgetter
+import os
+import glob
+from tqdm import tqdm
 
 @dataclass
 class Chunker:
@@ -26,6 +29,12 @@ class RetriEval:
         self.embedding = embedding
         self.retrived_chunks = retrived_chunks
 
+        if hasattr(self.chunker, 'split_text') and not callable(self.chunker.split_text):
+            raise ValueError("chunker must implement the split_text method")
+        
+        if hasattr(self.embedding, 'embed') and not callable(self.embedding.embed):
+            raise ValueError("embedding must implement the embed method")
+
     def _retrival(self, chunks, query):
         corpus_embeddings = self.embedding.embed(chunks)
         query_embeddings = self.embedding.embed(query)
@@ -42,37 +51,62 @@ class RetriEval:
         end_index = start_index + len(target)
         return start_index, end_index
 
-    def evaulate(self, corpus, questions_df):
-        '''
-        Evaluate the retrival system using the corpus and questions_df.
+    def _load_data(self):
 
-        :param corpus: Text to chunk
-        :type corpus: str
-        :param questions_df: 
-        :type questions_df: pd.DataFrame
+        repo_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        md_file_paths = glob.glob(os.path.join(f'{repo_path}/data', '*.md'))
+        
+        questions_df = pd.read_csv(os.path.join(f'{repo_path}/data', 'questions_df.csv'))
+
+        questions_df['references'] = questions_df['references'].apply(json.loads)
+
+        markdown_files = {}
+        
+        for file_path in md_file_paths:
+            filename = os.path.splitext(os.path.basename(file_path))[0]
+
+            with open(file_path, 'r', encoding='utf-8') as file:
+                content = file.read()
+            
+            markdown_files[filename] = content
+        
+        return markdown_files, questions_df
+
+    def evaulate(self):
+        '''
+        Evaluate the retrival system.
+
         :return: DataFrame with the metrics "f1", "precision", "recall", "iou"
         :rtype: pd.DataFrame
 
         '''
-        if not isinstance(questions_df, pd.DataFrame):
-            raise ValueError("questions_df must be a pandas DataFrame")
-        
-        questions_df['references'] = questions_df['references'].apply(json.loads)
 
-        chunks = self.chunker.split_text(corpus)
-        chunks_range = [self._find_target_in_document(corpus, chunk) for chunk in chunks]
+        markdown_files, questions_df = self._load_data()
+        
+        chunked_files = {}
+        chunks_range = {}
+
+        for filename in markdown_files:
+            chunked_files[filename] = self.chunker.split_text(markdown_files[filename])
+            chunks_range[filename] = [self._find_target_in_document(markdown_files[filename], chunk) for chunk in chunked_files[filename]]
+
+        del markdown_files
+
         metrics = {'precision': [], 'recall': [], 'f1': [], 'iou': []}
         
-        
-        for row in questions_df.iterrows():
-            query = row[1]['question']
+        for _, row in tqdm(questions_df.iterrows(), desc="Evaluating...", total=questions_df.shape[0]):
 
-            topk_indices = self._retrival(chunks, query)
+            query = row['question']
+            corpus_id = row['corpus_id']
+
+            topk_indices = self._retrival(chunked_files[corpus_id], query)
 
             # We dont want to mess up list types with numpy arrays
-            relevant_chunks_range = list(itemgetter(*topk_indices)(chunks_range))
+            relevant_chunks_range = list(itemgetter(*topk_indices)(chunks_range[corpus_id]))
             
-            excerpts_ranges = [(excerpt['start_index'], excerpt['end_index']) for excerpt in row[1]['references']]
+            excerpts_ranges = [(excerpt['start_index'], excerpt['end_index']) for excerpt in row['references']]
+
 
             int_len = 0
             exc_len = 0
@@ -89,7 +123,7 @@ class RetriEval:
                         unused_ranges = reduce(self._reduce_to_list, [self._left_diffrence(u_range, intersection_range) for u_range in unused_ranges])
                         
                         
-                exc_len += self._range_length(relevant_chunks_range)
+                exc_len += self._range_length(excerpt_range)
             
             unused_len = sum([self._range_length(range) for range in unused_ranges])
             int_len = relevant_chunks_len - unused_len
@@ -99,19 +133,8 @@ class RetriEval:
             metrics['iou'].append(int_len / (relevant_chunks_len + exc_len - int_len))
             metrics['f1'].append(2 * int_len / (relevant_chunks_len + exc_len))
             
-        metrics_df = pd.DataFrame(metrics).mean()
-        metrics_df['corpus'] = questions_df['corpus_id'].iloc[0]
-        metrics_df['retrived_chunks'] = self.retrived_chunks
-
-        mean_values = pd.DataFrame(metrics).mean()
-        std_values = pd.DataFrame(metrics).std()
-
-        formatted_stats = pd.DataFrame({
-            metric: [f"{mean:.2f}±{std:.2f}"] 
-            for metric, mean, std in zip(mean_values.index, mean_values, std_values)
-        })
-
-        return formatted_stats
+    
+        return pd.DataFrame(metrics)
     
     def _intersection(self, range1, range2):
 
@@ -151,8 +174,10 @@ class RetriEval:
 
 
     def _reduce_to_list(self, list1, list2):
-        if list1 is None or list2 is None:
-            return None
+        if list1 is None:
+            return list2
+        if list2 is None:
+            return list1
         
         return list1 + list2
         
